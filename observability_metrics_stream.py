@@ -5,7 +5,7 @@ author: Willian Zhang
 project_url: https://github.com/Willian-Zhang/openwebui-functions
 funding_url: https://github.com/sponsors/Willian-Zhang
 original_author: vigneshwarrvenkat
-version: 0.10
+version: 0.11
 required_open_webui_version: 0.5.17
 
 Open WebUI **filter** (`type: filter`): streams timing hints using the existing
@@ -29,6 +29,14 @@ Timing model:
   TTFT — TTFT includes network/queue time, so it is a lower bound on the
   server's true prefill speed and is labeled "incl. latency". In the
   wall-time fallback (no observable TTFT) only the count is shown.
+- Field compatibility: usage lookups fan out over both OpenAI-style names
+  (`prompt_tokens`/`completion_tokens`, `prompt_tokens_details`/
+  `completion_tokens_details`) and Responses-API-style names
+  (`input_tokens`/`output_tokens`, `input_tokens_details`/
+  `output_tokens_details`). When present, `cached_tokens`,
+  `cache_write_tokens`, `reasoning_tokens`, a `usage.cost.total_cost`
+  (+ `currency`), `turn_count`, and `function_call_count` are appended to
+  the final summary — all exact/provider-reported, so never "~"-prefixed.
 
 Debugging: turn on the `debug_prompt_breakdown` valve to emit an extra status
 line at request start showing what the filter can see in the inlet body
@@ -89,22 +97,116 @@ def _fmt_duration(seconds: float) -> str:
     return f"{max(0.0, seconds):.2f} s"
 
 
-def _extract_usage_int(body: Mapping[str, Any], keys: tuple[str, ...]) -> int | None:
-    """Best-effort token count from usage objects in an outlet body."""
-    candidates: list[Any] = [body.get("usage")]
+_USAGE_KEY_HINTS = frozenset(
+    {"prompt_tokens", "completion_tokens", "input_tokens", "output_tokens"}
+)
+
+
+def _find_usage_dicts(
+    obj: Any,
+    out: list[Mapping[str, Any]],
+    seen_ids: set[int],
+    depth: int = 0,
+    max_depth: int = 6,
+) -> None:
+    """Recursively scan for dicts that look like a usage object.
+
+    Fallback for pipes that stash usage/cost somewhere non-standard (nested
+    under `info`, a tool-call result, etc.) instead of the conventional
+    `usage` key. Bounded by depth/count so it stays cheap on normal bodies.
+    """
+    if depth > max_depth or len(out) >= 8:
+        return
+    if isinstance(obj, Mapping):
+        if id(obj) not in seen_ids and (obj.keys() & _USAGE_KEY_HINTS):
+            seen_ids.add(id(obj))
+            out.append(obj)
+        for v in obj.values():
+            _find_usage_dicts(v, out, seen_ids, depth + 1, max_depth)
+    elif isinstance(obj, list):
+        for item in obj:
+            _find_usage_dicts(item, out, seen_ids, depth + 1, max_depth)
+
+
+def _usage_candidates(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Usage mappings that might appear in an outlet body.
+
+    Providers disagree on where usage lives and on key names (OpenAI's
+    `prompt_tokens`/`completion_tokens` vs. the Responses-API-style
+    `input_tokens`/`output_tokens`, etc.), so every lookup below fans out
+    over this same candidate list. The conventional locations are checked
+    first; a bounded recursive scan of the whole body is the fallback for
+    non-standard placements.
+    """
+    candidates: list[Mapping[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    def add(m: Any) -> None:
+        if isinstance(m, Mapping) and id(m) not in seen_ids:
+            seen_ids.add(id(m))
+            candidates.append(m)
+
+    add(body.get("usage"))
     messages = body.get("messages")
     if isinstance(messages, list):
         for msg in reversed(messages):
             if isinstance(msg, Mapping) and msg.get("role") == "assistant":
-                candidates.append(msg.get("usage"))
+                add(msg.get("usage"))
                 break
-    for usage in candidates:
-        if isinstance(usage, Mapping):
-            for key in keys:
-                ct = usage.get(key)
-                if isinstance(ct, (int, float)) and ct > 0:
-                    return int(ct)
+
+    _find_usage_dicts(body, candidates, seen_ids)
+    return candidates
+
+
+def _extract_usage_int(body: Mapping[str, Any], keys: tuple[str, ...]) -> int | None:
+    """Best-effort token count from usage objects in an outlet body."""
+    for usage in _usage_candidates(body):
+        for key in keys:
+            ct = usage.get(key)
+            if isinstance(ct, (int, float)) and ct > 0:
+                return int(ct)
     return None
+
+
+def _extract_usage_nested_int(
+    body: Mapping[str, Any], paths: tuple[tuple[str, str], ...]
+) -> int | None:
+    """Best-effort int from nested `*_details` usage sub-objects.
+
+    Handles both the OpenAI-style `prompt_tokens_details`/
+    `completion_tokens_details` naming and the Responses-API-style
+    `input_tokens_details`/`output_tokens_details` naming, e.g. for
+    `cached_tokens`, `cache_write_tokens`, `reasoning_tokens`.
+    """
+    for usage in _usage_candidates(body):
+        for outer, inner in paths:
+            sub = usage.get(outer)
+            if isinstance(sub, Mapping):
+                v = sub.get(inner)
+                if isinstance(v, (int, float)) and v > 0:
+                    return int(v)
+    return None
+
+
+def _extract_usage_cost(body: Mapping[str, Any]) -> tuple[float, str] | None:
+    """Best-effort (total_cost, currency) from a `usage.cost` object."""
+    for usage in _usage_candidates(body):
+        cost = usage.get("cost")
+        if isinstance(cost, Mapping):
+            total = cost.get("total_cost")
+            if isinstance(total, (int, float)):
+                currency = cost.get("currency")
+                return (float(total), currency if isinstance(currency, str) else "USD")
+    return None
+
+
+def _fmt_cost(amount: float, currency: str) -> str:
+    symbol = "$" if currency.upper() == "USD" else ""
+    # Costs are exact (provider-reported), so no "~" prefix; use more
+    # decimals for very small amounts so they don't round to zero.
+    if symbol:
+        return f"{symbol}{amount:.6f}" if amount < 0.01 else f"{symbol}{amount:.4f}"
+    return f"{amount:.6f} {currency}"
 
 
 def _prompt_breakdown(body: Mapping[str, Any]) -> str:
@@ -343,10 +445,15 @@ class Filter:
                 st["approx_chars"] = st.get("approx_chars", 0) + len(chars)
 
         if isinstance(usage, Mapping) and usage:
+            # Accept both OpenAI-style and Responses-API-style key names.
             ct = usage.get("completion_tokens")
+            if not isinstance(ct, (int, float)) or ct <= 0:
+                ct = usage.get("output_tokens")
             if isinstance(ct, (int, float)) and ct > 0:
                 st["completion_tokens"] = int(ct)
             pt = usage.get("prompt_tokens")
+            if not isinstance(pt, (int, float)) or pt <= 0:
+                pt = usage.get("input_tokens")
             if isinstance(pt, (int, float)) and pt > 0:
                 st["prompt_tokens"] = int(pt)
 
@@ -461,6 +568,50 @@ class Filter:
                 summary_parts.append(
                     f"tg {tok_p}{tokens} tok, {tok_p}{avg_tps} tok/s incl. latency"
                 )
+
+        # Extra provider-reported detail (all exact, so never "~"-prefixed):
+        # cache/reasoning token breakdowns and cost. Field names vary across
+        # providers (prompt_tokens_details vs. input_tokens_details, etc.),
+        # so _extract_usage_nested_int/_extract_usage_cost fan out over both.
+        cached_tokens = _extract_usage_nested_int(
+            body,
+            (
+                ("input_tokens_details", "cached_tokens"),
+                ("prompt_tokens_details", "cached_tokens"),
+            ),
+        )
+        cache_write_tokens = _extract_usage_nested_int(
+            body,
+            (
+                ("input_tokens_details", "cache_write_tokens"),
+                ("prompt_tokens_details", "cache_write_tokens"),
+            ),
+        )
+        reasoning_tokens = _extract_usage_nested_int(
+            body,
+            (
+                ("output_tokens_details", "reasoning_tokens"),
+                ("completion_tokens_details", "reasoning_tokens"),
+            ),
+        )
+        if cached_tokens:
+            summary_parts.append(f"cached {cached_tokens} tok")
+        if cache_write_tokens:
+            summary_parts.append(f"cache write {cache_write_tokens} tok")
+        if reasoning_tokens:
+            summary_parts.append(f"reasoning {reasoning_tokens} tok")
+
+        turn_count = _extract_usage_int(body, ("turn_count",))
+        if isinstance(turn_count, int) and turn_count > 1:
+            summary_parts.append(f"{turn_count} turns")
+        function_call_count = _extract_usage_int(body, ("function_call_count",))
+        if isinstance(function_call_count, int) and function_call_count > 0:
+            summary_parts.append(f"{function_call_count} tool calls")
+
+        cost = _extract_usage_cost(body)
+        if cost is not None:
+            amount, currency = cost
+            summary_parts.append(_fmt_cost(amount, currency))
 
         await self._emit(
             __event_emitter__, description=" · ".join(summary_parts), done=True
